@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "dgSpecHash": "MEzDqPwvoQOxlX5P41OhJ5sHGbHA+r+Hz1sEf9nol0X2nXAp1eStYjXcdg2w7FoaqPYEKYGA4wmdWun1fHnB4Q==",
+  "success": true,
+  "projectFilePath": "H:\\GIT\\decompress\\src\\decompress\\decompress.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\wagne\\.nuget\\packages\\amazon.lambda.core\\2.0.0\\amazon.lambda.core.2.0.0.nupkg.sha512",
+    "C:\\Users\\wagne\\.nuget\\packages\\amazon.lambda.serialization.systemtextjson\\2.1.0\\amazon.lambda.serialization.systemtextjson.2.1.0.nupkg.sha512",
+    "C:\\Users\\wagne\\.nuget\\packages\\awssdk.core\\3.7.0.45\\awssdk.core.3.7.0.45.nupkg.sha512",
+    "C:\\Users\\wagne\\.nuget\\packages\\awssdk.lambda\\3.7.1.6\\awssdk.lambda.3.7.1.6.nupkg.sha512",
+    "C:\\Users\\wagne\\.nuget\\packages\\awssdk.s3\\3.7.1.15\\awssdk.s3.3.7.1.15.nupkg.sha512"
+  ],
+  "logs": []
+}
