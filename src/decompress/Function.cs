@@ -19,77 +19,66 @@ namespace decompress
 {
     public class Function
     {
-        const int COMPRESSED_BUFFER = 1024 * 1024 * 1;
-        const int UNCOMPRESSED_BUFFER = 1024 * 1024 * 1;
+        const int UNCOMPRESSED_BUFFER = 1024 * 1024 * 10;
 
         public async Task<string> FunctionHandler(Payload input, ILambdaContext context)
         {
             LambdaLogger.Log($"Payload: {JsonSerializer.Serialize(input)}\r\n");
-            long currentPosition = input.initialPosition;
             var s3Client = new AmazonS3Client(RegionEndpoint.USEast1);
             var s3SourceMetadata = await s3Client.GetObjectMetadataAsync(input.sourceBucket, input.sourceFile);
-            var totalFileLength = s3SourceMetadata.ContentLength;
-            var buffer = new byte[COMPRESSED_BUFFER];
+            var totalBytesRead = 0;
 
-            if (currentPosition == 0 && await S3FileExists(s3Client, input.targetBucket, input.targetFile))
+            if (await S3FileExists(s3Client, input.targetBucket, input.targetFile))
             {
                 LambdaLogger.Log($"Deleting object on S3: {input.targetBucket}/{input.targetFile}\r\n");
                 await s3Client.DeleteObjectAsync(input.targetBucket, input.targetFile);
             }
 
-            if (currentPosition == 0)
+            var multipartResponse = await s3Client.InitiateMultipartUploadAsync(input.targetBucket, input.targetFile);
+            LambdaLogger.Log($"Initiated S3 multipart: response: {multipartResponse.HttpStatusCode}:{multipartResponse.UploadId}\r\n");
+            input.multipartId = multipartResponse.UploadId;
+
+            LambdaLogger.Log($"Getting the file {input.sourceFile}\r\n");
+            var s3ObjectSource = await s3Client.GetObjectAsync(new GetObjectRequest()
             {
-                var multipartResponse = await s3Client.InitiateMultipartUploadAsync(input.targetBucket, input.targetFile);
-                LambdaLogger.Log($"Initiated S3 multipart: response: {multipartResponse.HttpStatusCode}:{multipartResponse.UploadId}\r\n");
-                input.multipartId = multipartResponse.UploadId;
-            }
+                BucketName = input.sourceBucket,
+                Key = input.sourceFile,
+            });
+            LambdaLogger.Log($"Response {s3ObjectSource.HttpStatusCode}\r\n");
 
-            while (currentPosition < totalFileLength && !IsTimeoutComing(context))
+            using (var sourceStream = s3ObjectSource.ResponseStream)
             {
-                var bytesToRead = Math.Min(buffer.Length, totalFileLength - currentPosition);
-                LambdaLogger.Log($"Getting chunk from position {currentPosition} with length {bytesToRead}\r\n");
-                var s3ObjectSource = await s3Client.GetObjectAsync(new GetObjectRequest()
+                using (GZipStream gzipStream = new GZipStream(sourceStream, CompressionMode.Decompress))
                 {
-                    BucketName = input.sourceBucket,
-                    Key = input.sourceFile,
-                    ByteRange = new ByteRange(currentPosition, currentPosition + bytesToRead)
-                });
-
-                LambdaLogger.Log($"Response {s3ObjectSource.HttpStatusCode}\r\n");
-
-                using (var sourceStream = s3ObjectSource.ResponseStream)
-                {
-                    using (GZipStream gzipStream = new GZipStream(sourceStream, CompressionMode.Decompress))
+                    int read = 0;
+                    do 
                     {
-                        MemoryStream msOutput = new MemoryStream();
-                        await gzipStream.CopyToAsync(msOutput);
-                        msOutput.Position = 0;
-
-                        //var uncompressedBuffer = new byte[UNCOMPRESSED_BUFFER];
-                        //var read = await gzipStream.ReadAsync(uncompressedBuffer, 0, uncompressedBuffer.Length);
-                        var partNumber = ((int)Math.Ceiling((double)(currentPosition / COMPRESSED_BUFFER))) + 1;
-                        LambdaLogger.Log($"Uploading part#:{partNumber}, read bytes: {msOutput.Length}\r\n");
+                        var uncompressedBuffer = new byte[UNCOMPRESSED_BUFFER];
+                        read = await gzipStream.ReadAsync(uncompressedBuffer, 0, uncompressedBuffer.Length);
+                        totalBytesRead += read;
+                        input.partNumber++;
+                        LambdaLogger.Log($"Uploading part#:{input.partNumber}, read bytes: {read}, total bytes read: {totalBytesRead}\r\n");
                         var uploadResponse = await s3Client.UploadPartAsync(new UploadPartRequest()
                         {
                             UploadId = input.multipartId,
-                            PartNumber = partNumber,
+                            PartNumber = input.partNumber,
                             BucketName = input.targetBucket,
                             Key = input.targetFile,
-                            InputStream = msOutput
-                            //InputStream = new MemoryStream(uncompressedBuffer, 0, read)
+                            InputStream = new MemoryStream(uncompressedBuffer, 0, read)
                         });
-                        LambdaLogger.Log($"Response {uploadResponse.HttpStatusCode}\r\n");
+                        //LambdaLogger.Log($"Response {uploadResponse.HttpStatusCode}, total bytes {totalBytesRead}\r\n");
                     }
+                    while(read > 0);
                 }
-                
-                currentPosition += bytesToRead;
             }
 
-            if (currentPosition < totalFileLength && IsTimeoutComing(context))
+            var nextFileName = NextFileName(input.sourceFile) ?? string.Empty;
+            if (await S3FileExists(s3Client, input.sourceBucket, nextFileName))
             {
                 Payload nextChunkPayload = (Payload)input.Clone();
-                nextChunkPayload.initialPosition = currentPosition;
-                await NextChunk(nextChunkPayload);
+                nextChunkPayload.sourceFile = nextFileName;
+                LambdaLogger.Log($"Starting next file: {nextChunkPayload.sourceFile}\r\n");
+                await NextFile(nextChunkPayload);
             }
             else
             {
@@ -100,14 +89,19 @@ namespace decompress
                 });
             }
 
-            LambdaLogger.Log($"Stopped at: {currentPosition}\r\n");
-            return $"Stopped at: {currentPosition}\r\n";
+            LambdaLogger.Log($"File processed: {input.sourceFile}, total bytes {totalBytesRead}\r\n");
+            return $"File processed: {input.sourceFile}, total bytes {totalBytesRead}\r\n";
+
         }
 
-        private bool IsTimeoutComing(ILambdaContext context)
+        private string NextFileName(string sourceFile)
         {
-            LambdaLogger.Log($"IsTimeoutComing: {context.RemainingTime.TotalSeconds}\r\n");
-            return context.RemainingTime.TotalSeconds < 60;
+            var split = sourceFile.Split('.');
+            if (int.TryParse(split.LastOrDefault(), out int index)) {
+                split[split.Length-1] = (index+1).ToString().PadLeft(split.LastOrDefault().Length, '0');
+                return string.Join('.',split);
+            }
+            return null;
         }
 
         private async Task<bool> S3FileExists(AmazonS3Client s3Client, string bucket, string fileName)
@@ -116,7 +110,7 @@ namespace decompress
             return (await s3Client.ListObjectsAsync(bucket, fileName)).S3Objects.Count != 0;
         }
 
-        public async Task NextChunk(Payload input)
+        public async Task NextFile(Payload input)
         {
             try
             {
@@ -124,7 +118,7 @@ namespace decompress
                 {
                     var request = new InvokeRequest
                     {
-                        FunctionName = "decompress2",//Function1:v1 if you use alias
+                        FunctionName = "decompress2",
                         Payload = JsonSerializer.Serialize(input),
                         InvocationType = InvocationType.Event
                     };
