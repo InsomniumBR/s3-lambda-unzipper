@@ -19,79 +19,154 @@ namespace decompress
 {
     public class Function
     {
-        const int UNCOMPRESSED_BUFFER = 1024 * 1024 * 10;
+        // defines how many bytes to read from s3 each read from stream.
+        const int DECOMPRESS_INPUT_BUFFER_SIZE = 1024 * 1024 * 10; 
+        
+        // impacts on the number of uploaded parts based on extracted bytes.
+        const int MAX_TEMP_BUFFER = 1024 * 1024 * 100; 
 
-        public async Task<string> FunctionHandler(Payload input, ILambdaContext context)
+        private AmazonS3Client _s3Client = null;
+        private ILambdaContext _context = null;
+        private Payload _payload = null;
+
+        public Function()
         {
-            LambdaLogger.Log($"Payload: {JsonSerializer.Serialize(input)}\r\n");
-            var s3Client = new AmazonS3Client(RegionEndpoint.USEast1);
-            var s3SourceMetadata = await s3Client.GetObjectMetadataAsync(input.sourceBucket, input.sourceFile);
-            var totalBytesRead = 0;
+            _s3Client = new AmazonS3Client(RegionEndpoint.USEast1);
+        }
 
-            if (await S3FileExists(s3Client, input.targetBucket, input.targetFile))
+        public async Task<string> FunctionHandler(Payload payload, ILambdaContext context)
+        {
+            SetContext(context);
+            SetPayload(payload);
+
+            var sourceMetadata = await GetSourceObjectMetadata();
+            var totalBytesRead = 0;
+            var totalBytesReadPart = 0;
+
+            // adjust inputs
+            if (_payload.partList == null) _payload.partList = new List<PartETag>();
+
+            await DeleteObjectIfExists();
+
+            bool firstFileOnJob = (_payload.partNumber == 0);
+            if (firstFileOnJob)
             {
-                LambdaLogger.Log($"Deleting object on S3: {input.targetBucket}/{input.targetFile}\r\n");
-                await s3Client.DeleteObjectAsync(input.targetBucket, input.targetFile);
+                await InitiateMultpartUpload();
+                _payload.partNumber = 1;
             }
 
-            var multipartResponse = await s3Client.InitiateMultipartUploadAsync(input.targetBucket, input.targetFile);
-            LambdaLogger.Log($"Initiated S3 multipart: response: {multipartResponse.HttpStatusCode}:{multipartResponse.UploadId}\r\n");
-            input.multipartId = multipartResponse.UploadId;
-
-            LambdaLogger.Log($"Getting the file {input.sourceFile}\r\n");
-            var s3ObjectSource = await s3Client.GetObjectAsync(new GetObjectRequest()
-            {
-                BucketName = input.sourceBucket,
-                Key = input.sourceFile,
-            });
-            LambdaLogger.Log($"Response {s3ObjectSource.HttpStatusCode}\r\n");
-
-            using (var sourceStream = s3ObjectSource.ResponseStream)
+            MemoryStream tempBuffer = null;
+            using (Stream sourceStream = await GetSourceObjectStream())
             {
                 using (GZipStream gzipStream = new GZipStream(sourceStream, CompressionMode.Decompress))
                 {
-                    int read = 0;
-                    do 
+                    int bytesRead = 0;
+                    do
                     {
-                        var uncompressedBuffer = new byte[UNCOMPRESSED_BUFFER];
-                        read = await gzipStream.ReadAsync(uncompressedBuffer, 0, uncompressedBuffer.Length);
-                        totalBytesRead += read;
-                        input.partNumber++;
-                        LambdaLogger.Log($"Uploading part#:{input.partNumber}, read bytes: {read}, total bytes read: {totalBytesRead}\r\n");
-                        var uploadResponse = await s3Client.UploadPartAsync(new UploadPartRequest()
+                        if (tempBuffer == null) tempBuffer = new MemoryStream(MAX_TEMP_BUFFER);
+
+                        var decompressedBuffer = new byte[DECOMPRESS_INPUT_BUFFER_SIZE];
+                        bytesRead = gzipStream.Read(decompressedBuffer, 0, decompressedBuffer.Length);
+                        tempBuffer.Write(decompressedBuffer, 0, bytesRead);
+                        totalBytesReadPart += bytesRead;
+                        //LambdaLogger.Log($"[{RemainingTime()}] just read {bytesRead} bytes\r\n");
+
+                        bool readNothingNow = (bytesRead == 0)
+                            , readSomethingBefore = (totalBytesReadPart != 0)
+                            , exccededBufferLimit = totalBytesReadPart > MAX_TEMP_BUFFER;
+
+                        if (exccededBufferLimit || (readNothingNow && readSomethingBefore))
                         {
-                            UploadId = input.multipartId,
-                            PartNumber = input.partNumber,
-                            BucketName = input.targetBucket,
-                            Key = input.targetFile,
-                            InputStream = new MemoryStream(uncompressedBuffer, 0, read)
-                        });
-                        //LambdaLogger.Log($"Response {uploadResponse.HttpStatusCode}, total bytes {totalBytesRead}\r\n");
+                            LambdaLogger.Log($"[{RemainingTime()}] Uploading part#:{this._payload.partNumber}, total bytes extracted: {totalBytesReadPart}\r\n");
+                            await UploadPart(tempBuffer);
+                            totalBytesRead += totalBytesReadPart;
+
+                            // reset vars
+                            totalBytesReadPart = 0;
+                            tempBuffer.Dispose();
+                            tempBuffer = null;
+                            GC.Collect();
+                        }
                     }
-                    while(read > 0);
+                    while (bytesRead > 0);
                 }
             }
 
-            var nextFileName = NextFileName(input.sourceFile) ?? string.Empty;
-            if (await S3FileExists(s3Client, input.sourceBucket, nextFileName))
+            var nextFileName = NextFileName(_payload.sourceFile);
+            if (nextFileName != null && await S3FileExists(_payload.sourceBucket, nextFileName))
             {
-                Payload nextChunkPayload = (Payload)input.Clone();
+                Payload nextChunkPayload = (Payload)_payload.Clone();
                 nextChunkPayload.sourceFile = nextFileName;
-                LambdaLogger.Log($"Starting next file: {nextChunkPayload.sourceFile}\r\n");
+                LambdaLogger.Log($"[{RemainingTime()}] Continuing on next file: {nextChunkPayload.sourceFile}\r\n");
                 await NextFile(nextChunkPayload);
             }
             else
+                await CompleteMultipartUpload();
+
+            LambdaLogger.Log($"[{RemainingTime()}] File processed: {_payload.sourceFile}, output to:{_payload.targetFile}, total bytes {totalBytesRead}\r\n");
+            return $"[{RemainingTime()}] File processed: {_payload.sourceFile}, output to:{_payload.targetFile}, total bytes {totalBytesRead}\r\n";
+
+        }
+
+        private async Task<GetObjectMetadataResponse> GetSourceObjectMetadata()
+        {
+            return await _s3Client.GetObjectMetadataAsync(_payload.sourceBucket, _payload.sourceFile);
+        }
+
+        private async Task CompleteMultipartUpload()
+        {
+            await _s3Client.CompleteMultipartUploadAsync(new CompleteMultipartUploadRequest()
             {
-                await s3Client.CompleteMultipartUploadAsync(new CompleteMultipartUploadRequest()
-                {
-                    BucketName = input.targetBucket,
-                    Key = input.targetFile
-                });
+                UploadId = _payload.multipartId,
+                BucketName = _payload.targetBucket,
+                Key = _payload.targetFile,
+                PartETags = _payload.partList
+            });
+            LambdaLogger.Log($"[{RemainingTime()}] Completing multipart upload with #{_payload.partList.Count} parts, id: {_payload.multipartId}\r\n");
+        }
+
+        private async Task UploadPart(MemoryStream tempBuffer)
+        {
+            tempBuffer.Position = 0;
+            var uploadResponse = await _s3Client.UploadPartAsync(new UploadPartRequest()
+            {
+                UploadId = _payload.multipartId,
+                PartNumber = _payload.partNumber,
+                BucketName = _payload.targetBucket,
+                Key = _payload.targetFile,
+                InputStream = tempBuffer
+            });
+            _payload.partList.Add(new PartETag(uploadResponse.PartNumber, uploadResponse.ETag));
+            _payload.partNumber++;
+            LambdaLogger.Log($"[{RemainingTime()}] Response {uploadResponse.HttpStatusCode}\r\n");
+        }
+
+        private async Task<Stream> GetSourceObjectStream()
+        {
+            LambdaLogger.Log($"[{RemainingTime()}] Getting the file {_payload.sourceFile}\r\n");
+            var s3ObjectSource = await _s3Client.GetObjectAsync(new GetObjectRequest()
+            {
+                BucketName = _payload.sourceBucket,
+                Key = _payload.sourceFile,
+            });
+            LambdaLogger.Log($"[{RemainingTime()}] Response {s3ObjectSource.HttpStatusCode}\r\n");
+            return s3ObjectSource.ResponseStream;
+        }
+
+        private async Task InitiateMultpartUpload()
+        {
+            var multipartResponse = await _s3Client.InitiateMultipartUploadAsync(_payload.targetBucket, _payload.targetFile);
+            LambdaLogger.Log($"[{RemainingTime()}] Initiated S3 multipart: response: {multipartResponse.HttpStatusCode}:{multipartResponse.UploadId}\r\n");
+            _payload.multipartId = multipartResponse.UploadId;
+        }
+
+        private async Task DeleteObjectIfExists()
+        {
+            if (await S3FileExists(_payload.targetBucket, _payload.targetFile))
+            {
+                LambdaLogger.Log($"[{RemainingTime()}] Deleting object on S3: {_payload.targetBucket}/{_payload.targetFile}\r\n");
+                await _s3Client.DeleteObjectAsync(_payload.targetBucket, _payload.targetFile);
             }
-
-            LambdaLogger.Log($"File processed: {input.sourceFile}, total bytes {totalBytesRead}\r\n");
-            return $"File processed: {input.sourceFile}, total bytes {totalBytesRead}\r\n";
-
         }
 
         private string NextFileName(string sourceFile)
@@ -104,10 +179,10 @@ namespace decompress
             return null;
         }
 
-        private async Task<bool> S3FileExists(AmazonS3Client s3Client, string bucket, string fileName)
+        private async Task<bool> S3FileExists(string bucket, string fileName)
         {
             LambdaLogger.Log($"Checking existance on S3: {bucket}/{fileName}\r\n");
-            return (await s3Client.ListObjectsAsync(bucket, fileName)).S3Objects.Count != 0;
+            return (await _s3Client.ListObjectsAsync(bucket, fileName)).S3Objects.Count != 0;
         }
 
         public async Task NextFile(Payload input)
@@ -130,6 +205,19 @@ namespace decompress
             {
                 LambdaLogger.Log(ex.Message);
             }
+        }
+
+        private string RemainingTime () {
+            return $"Timeout in : {_context.RemainingTime.TotalSeconds}";
+        }
+
+        private void SetContext (ILambdaContext context) {
+             _context = context;
+             LambdaLogger.Log($"[{RemainingTime()}] Starting... \r\n");
+        }
+        private void SetPayload (Payload payload) { 
+            _payload = payload;
+            LambdaLogger.Log($"[{RemainingTime()}] Payload: {JsonSerializer.Serialize(_payload)}\r\n");
         }
     }
 }

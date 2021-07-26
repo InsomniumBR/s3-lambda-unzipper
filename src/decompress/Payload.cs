@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using Amazon.S3.Model;
 
 public class Payload : ICloneable {
         public string sourceBucket {get; set;}
@@ -7,6 +9,7 @@ public class Payload : ICloneable {
         public string targetBucket {get; set;}
         public string targetFile {get; set;}
         public string multipartId {get; set;}
+        public List<PartETag> partList {get; set;}
 
         public object Clone()
         {
@@ -16,7 +19,8 @@ public class Payload : ICloneable {
                 sourceBucket = this.sourceBucket,
                 sourceFile = this.sourceFile,
                 targetBucket = this.targetBucket,
-                targetFile = this.targetFile
+                targetFile = this.targetFile,
+                partList = this.partList,
             };
         }
     }
