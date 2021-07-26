@@ -1,9 +1,0 @@
-H:\GIT\decompress\src\decompress\bin\Release\netcoreapp3.1\publish\decompress.dll
-H:\GIT\decompress\src\decompress\bin\Release\netcoreapp3.1\publish\decompress.deps.json
-H:\GIT\decompress\src\decompress\bin\Release\netcoreapp3.1\publish\decompress.runtimeconfig.json
-H:\GIT\decompress\src\decompress\bin\Release\netcoreapp3.1\publish\decompress.pdb
-H:\GIT\decompress\src\decompress\bin\Release\netcoreapp3.1\publish\Amazon.Lambda.Core.dll
-H:\GIT\decompress\src\decompress\bin\Release\netcoreapp3.1\publish\Amazon.Lambda.Serialization.SystemTextJson.dll
-H:\GIT\decompress\src\decompress\bin\Release\netcoreapp3.1\publish\AWSSDK.Core.dll
-H:\GIT\decompress\src\decompress\bin\Release\netcoreapp3.1\publish\AWSSDK.Lambda.dll
-H:\GIT\decompress\src\decompress\bin\Release\netcoreapp3.1\publish\AWSSDK.S3.dll

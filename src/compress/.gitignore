@@ -1,0 +1,11 @@
+.vs/
+.vscode/
+bin/
+obj/
+node_modules/
+
+# User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
