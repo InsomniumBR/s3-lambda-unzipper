@@ -9,6 +9,8 @@ For that, you have two tools:
 
 Unfortunately, no. When you zip your file and ask the 7zip (for instance) to split the file, just the first file has the stream header with information useful on decompression. This compressor is a simple tool to generate N streams, each one with a header and containing a part of the big file being zipped. So, we have many complete streams, instead of a splited stream.
 
+*PS: If you want to decompress just one Gzip file, compressed anywhere (7zip or another), it will work. But if you want to unzip splitted files you must use my compressor.*
+
 ## How this lambda works
 
 Since the lambda has only 15 minutes for running to completion, the context being processed inside a lambda cannot surpass this interval to be uncompressed and saved back to s3. This lambda will read the source file from s3, and write the uncompressed file back to s3 on the target file. If this function detects a 'continuation' (the first file ends with .001, the next file .002 exists) it will call itself again (loop) for continuing the job, until the last part found is uncompressed and the multipart upload (created on the first part) is completed.
