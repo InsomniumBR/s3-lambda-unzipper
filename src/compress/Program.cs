@@ -21,12 +21,17 @@ namespace compress
 
         static void Main(string[] args)
         {
-            if (args.Length != 6) PrintHelp();
+            if (args.Length != 6) {
+                 PrintHelp();
+                 return;
+            }
 
             var settings = ParseSettings(args);
 
-            if (!settings.IsValid())
+            if (!settings.IsValid()) {
                 Abend("Invalid arguments detected, check if size is greater than 0.");
+                return;
+            }
             else
                 Compress(settings);
         }
